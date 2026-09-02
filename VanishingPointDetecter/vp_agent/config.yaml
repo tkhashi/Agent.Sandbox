@@ -1,0 +1,19 @@
+vlm:
+  provider: "ollama"   # "ollama" | "openai"
+  ollama:
+    model: "gemma4:e4b"
+    host: "http://localhost:11434"
+  openai:
+    model: "gpt-4o-mini"
+    api_key_env: "OPENAI_API_KEY"
+
+cv:
+  canny_low: 50
+  canny_high: 150
+  min_lines_threshold: 5
+  min_cluster_lines: 3
+  max_vp_distance_ratio: 50.0
+
+agent:
+  max_steps: 5
+  max_retry_attempts: 2
