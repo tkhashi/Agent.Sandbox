@@ -18,22 +18,16 @@
 from __future__ import annotations
 
 import re
-import statistics
 from dataclasses import dataclass
 from typing import Literal
 
 from ..schema import VectorRecord
+from .geometry import MIN_SPAN_RATIO, find_chain_runs, find_circles, record_center
 
 _LABEL_PATTERN = re.compile(r"^[A-Za-z]{0,3}[0-9]{0,3}$")
 _SEQUENCE_PATTERN = re.compile(r"^([A-Za-z]*)([0-9]*)$")
 
-_CIRCLE_MIN_POINTS = 8
-_CIRCLE_RELATIVE_STD_MAX = 0.05
 _LABEL_SEARCH_RADIUS_FACTOR = 1.5
-_AXIS_ALIGN_TOLERANCE = 0.5  # ptの高さ/幅がこれ以下なら軸並行とみなす
-_COORDINATE_TOLERANCE = 0.75  # pt。共線とみなす座標差の許容値
-_MIN_CLUSTER_SEGMENTS = 5
-_MIN_SPAN_RATIO = 0.1  # ページ寸法に対する最低スパン比
 
 
 @dataclass(frozen=True)
@@ -57,44 +51,16 @@ class GridLine:
     sequence_plausible: bool
 
 
-def _record_center(record: VectorRecord) -> tuple[float, float] | None:
-    x0, x1 = record.get("x0"), record.get("x1")
-    top, bottom = record.get("top"), record.get("bottom")
-    if None in (x0, x1, top, bottom):
-        return None
-    return ((x0 + x1) / 2, (top + bottom) / 2)
-
-
-def _find_circles(records: list[VectorRecord]) -> list[tuple[int, tuple[float, float], float]]:
-    circles: list[tuple[int, tuple[float, float], float]] = []
-    for index, record in enumerate(records):
-        if record["object_type"] != "curve":
-            continue
-        pts = record.get("pts")
-        if not pts or len(pts) < _CIRCLE_MIN_POINTS:
-            continue
-        cx = sum(p[0] for p in pts) / len(pts)
-        cy = sum(p[1] for p in pts) / len(pts)
-        distances = [((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 for x, y in pts]
-        mean_d = sum(distances) / len(distances)
-        if mean_d <= 0:
-            continue
-        std_d = statistics.pstdev(distances)
-        if std_d / mean_d <= _CIRCLE_RELATIVE_STD_MAX:
-            circles.append((index, (cx, cy), mean_d))
-    return circles
-
-
 def _find_labels(records: list[VectorRecord]) -> list[GridLabel]:
     labels: list[GridLabel] = []
-    for circle_index, center, radius in _find_circles(records):
+    for circle_index, center, radius in find_circles(records):
         cx, cy = center
         search_radius = radius * _LABEL_SEARCH_RADIUS_FACTOR
         nearby: list[tuple[int, float, str]] = []
         for index, record in enumerate(records):
             if record["object_type"] != "char":
                 continue
-            char_center = _record_center(record)
+            char_center = record_center(record)
             if char_center is None:
                 continue
             chx, chy = char_center
@@ -122,43 +88,6 @@ def _find_labels(records: list[VectorRecord]) -> list[GridLabel]:
     return labels
 
 
-def _find_collinear_cluster(
-    records: list[VectorRecord], coordinate: float, axis: Literal["horizontal", "vertical"]
-) -> tuple[list[int], float, float] | None:
-    matched: list[int] = []
-    lo, hi = None, None
-
-    for index, record in enumerate(records):
-        if record["object_type"] != "line":
-            continue
-        x0, x1 = record.get("x0"), record.get("x1")
-        top, bottom = record.get("top"), record.get("bottom")
-        if None in (x0, x1, top, bottom):
-            continue
-
-        if axis == "horizontal":
-            if abs(top - bottom) > _AXIS_ALIGN_TOLERANCE:
-                continue
-            line_coord = (top + bottom) / 2
-            span_lo, span_hi = min(x0, x1), max(x0, x1)
-        else:
-            if abs(x0 - x1) > _AXIS_ALIGN_TOLERANCE:
-                continue
-            line_coord = (x0 + x1) / 2
-            span_lo, span_hi = min(top, bottom), max(top, bottom)
-
-        if abs(line_coord - coordinate) > _COORDINATE_TOLERANCE:
-            continue
-
-        matched.append(index)
-        lo = span_lo if lo is None else min(lo, span_lo)
-        hi = span_hi if hi is None else max(hi, span_hi)
-
-    if not matched or lo is None or hi is None:
-        return None
-    return matched, lo, hi
-
-
 def classify_grid_lines(
     records: list[VectorRecord],
     page_width: float | None = None,
@@ -175,13 +104,16 @@ def classify_grid_lines(
             ("horizontal", cy, page_height),
             ("vertical", cx, page_width),
         ):
-            cluster = _find_collinear_cluster(records, coordinate, axis)
-            if cluster is None:
+            # 通り芯は無関係な線に分断され、複数のランとして検出されることが
+            # あるため、その座標にある有効なラン(交互リズムを持つもの)を
+            # すべて合算した上で、通り芯としての規模(スパン)を判定する
+            runs = find_chain_runs(records, coordinate, axis)
+            if not runs:
                 continue
-            matched, lo, hi = cluster
-            if len(matched) < _MIN_CLUSTER_SEGMENTS:
-                continue
-            if page_dim is not None and (hi - lo) < page_dim * _MIN_SPAN_RATIO:
+            matched = [index for run in runs for index in run.indices]
+            lo = min(run.lo for run in runs)
+            hi = max(run.hi for run in runs)
+            if page_dim is not None and (hi - lo) < page_dim * MIN_SPAN_RATIO:
                 continue
             if best is None or len(matched) > len(best[1]):
                 best = (axis, matched, lo, hi)

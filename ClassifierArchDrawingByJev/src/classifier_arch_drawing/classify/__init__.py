@@ -7,6 +7,13 @@
 
 from __future__ import annotations
 
+from .dimension import DimensionSegment, classify_dimension_lines
 from .grid import GridLabel, GridLine, classify_grid_lines
 
-__all__ = ["GridLabel", "GridLine", "classify_grid_lines"]
+__all__ = [
+    "GridLabel",
+    "GridLine",
+    "classify_grid_lines",
+    "DimensionSegment",
+    "classify_dimension_lines",
+]
