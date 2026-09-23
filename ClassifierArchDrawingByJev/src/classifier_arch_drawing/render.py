@@ -81,11 +81,15 @@ def _char_transform(
 
 
 def _record_to_svg_element(
-    record: VectorRecord, linewidth_scale: float, page_height: float
+    record: VectorRecord,
+    linewidth_scale: float,
+    page_height: float,
+    highlight: bool = False,
+    highlight_color: str = "#ff4500",
 ) -> str | None:
     object_type = record["object_type"]
     linewidth = _effective_linewidth(record.get("linewidth"), linewidth_scale)
-    stroke = _color_to_css(record.get("stroking_color"), _DEFAULT_STROKE)
+    stroke = highlight_color if highlight else _color_to_css(record.get("stroking_color"), _DEFAULT_STROKE)
 
     if object_type in ("line", "rect"):
         pts = record.get("pts")
@@ -118,7 +122,7 @@ def _record_to_svg_element(
         text = record.get("text")
         if not text or text.isspace():
             return None
-        fill = _color_to_css(record.get("non_stroking_color"), _DEFAULT_FILL)
+        fill = highlight_color if highlight else _color_to_css(record.get("non_stroking_color"), _DEFAULT_FILL)
         escaped = (
             text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         )
@@ -152,12 +156,17 @@ def build_svg(
     page_height: float,
     object_types: tuple[str, ...] = ("line", "rect", "curve", "char"),
     linewidth_scale: float = 1.0,
+    highlight_indices: set[int] | None = None,
+    highlight_color: str = "#ff4500",
 ) -> str:
     elements: list[str] = []
-    for record in records:
+    for index, record in enumerate(records):
         if record["object_type"] not in object_types:
             continue
-        element = _record_to_svg_element(record, linewidth_scale, page_height)
+        highlight = highlight_indices is not None and index in highlight_indices
+        element = _record_to_svg_element(
+            record, linewidth_scale, page_height, highlight, highlight_color
+        )
         if element is not None:
             elements.append(element)
 

@@ -1,12 +1,12 @@
-# 建築図面PDFベクター情報抽出・再描画基盤 仕様書
+# 建築図面PDFベクター情報抽出・分類基盤 仕様書
 
 最終更新: 2026-09-23
 
 ## 1. 目的
 
-ベクター描画された建築図面PDF（例: `resouces/設計図-2階平面詳細図.pdf`）から、線・矩形・曲線・文字などのベクター情報を抽出し、後段の図面要素分類（通り芯線・寸法線・壁の中心線・引き出し線・扉開閉境界の円弧・通り芯番号など）で扱いやすい中間データ(JSON)として出力する。また、抽出結果の正しさを目視確認するため、抽出データからSVGへの再描画を行う。
+ベクター描画された建築図面PDF（例: `resouces/設計図-2階平面詳細図.pdf`）から、線・矩形・曲線・文字などのベクター情報を抽出し、中間データ(JSON)として出力する（**抽出タスク**）。さらに、その中間データを解釈して図面要素(通り芯線・通り芯番号・寸法線・壁の中心線・引き出し線・扉開閉境界の円弧など)を分類する（**分類タスク**）。両タスクの結果は、原本との一致度を目視確認するためSVGへの再描画も行う。
 
-分類ロジック自体は本仕様の範囲外（次フェーズ）であり、本仕様は「PDF→中間データ→SVG再描画による検証」までを対象とする。
+**抽出タスクと分類タスクはコード上疎結合であり、それぞれ独立に実行できる**(詳細は`docs/adr/0005-extract-classify-decoupling.md`)。分類タスクは抽出タスクが出力したJSONのみを入力とし、PDFファイル・`pdfplumber`には一切依存しない。
 
 ## 2. 技術構成
 
@@ -19,12 +19,18 @@
 
 ```
 src/classifier_arch_drawing/
-  schema.py        中間データの共通レコード形式(VectorRecord)を定義
-  extract.py        pdfplumberの生データをVectorRecordに正規化して抽出
-  calibration.py     線幅(linewidth)の自動キャリブレーション
-  render.py          VectorRecordのリストからSVGを再描画
-  cli.py             上記を束ねるCLIエントリポイント(`extract-vectors`)
+  schema.py            中間データの共通レコード形式(VectorRecord)を定義
+  extract.py            pdfplumberの生データをVectorRecordに正規化して抽出
+  calibration.py         線幅(linewidth)の自動キャリブレーション
+  render.py              VectorRecordのリストからSVGを再描画(ハイライト機能含む)
+  cli.py                 抽出タスクのCLIエントリポイント(`extract-vectors`)
+  classify/
+    __init__.py           分類ロジックの公開インターフェース
+    grid.py               通り芯・通り芯番号の分類ロジック
+  classify_cli.py        分類タスクのCLIエントリポイント(`classify-grid-lines`)
 ```
+
+`classify/`配下と`classify_cli.py`は`schema.VectorRecord`という**データ型のみ**に依存し、`extract.py`・`pdfplumber`・PDFファイルをimportしない。この依存方向(`classify → schema`のみ、`classify → extract`は無し)によって、抽出タスクと分類タスクの疎結合を保っている。
 
 ## 4. データモデル: `VectorRecord`
 
@@ -94,7 +100,9 @@ class CalibrationResult:
 
 ## 7. SVG再描画 (`render.py`)
 
-`build_svg(records, page_width, page_height, object_types=(...), linewidth_scale=1.0)`が中間データからSVG文字列を生成する。
+`build_svg(records, page_width, page_height, object_types=(...), linewidth_scale=1.0, highlight_indices=None, highlight_color="#ff4500")`が中間データからSVG文字列を生成する。
+
+`highlight_indices`(recordsリスト中のインデックス集合)を指定すると、該当レコードのみ`stroke`(line/rect/curve)または`fill`(char)を`highlight_color`で上書きする。それ以外のレコードは通常通りの色・線幅・回転で描画される。この仕組みは「通り芯」という概念を一切知らない汎用的なものであり、分類タスク側(`classify_cli.py`)が「どのインデックスをハイライトするか」を決めて渡す。
 
 ### 7.1 線・矩形・曲線
 
@@ -122,7 +130,7 @@ class CalibrationResult:
 
 - SVGは実際の埋め込みフォント(`AAAAAB+font0000000030638abc`等)ではなく代替フォント(`font-family="sans-serif"`)で描画している。そのため、グリフの字形・字送り幅が原本と完全には一致せず、通り芯番号などの文字位置にわずかな残差が残る。フォント埋め込み対応は別タスクとして保留している。
 
-## 8. CLI (`cli.py`)
+## 8. 抽出タスクCLI (`cli.py`)
 
 エントリポイント: `extract-vectors`(`pyproject.toml`の`[project.scripts]`で定義)
 
@@ -133,24 +141,105 @@ uv run extract-vectors <PDFパス> [-o 出力JSONパス] [--pretty] [--svg 出�
 
 | オプション | 説明 |
 |---|---|
-| `-o, --output` | 中間データ(全`VectorRecord`)をJSONファイルに出力 |
+| `-o, --output` | 中間データをJSONファイルに出力(形式は8.1節参照) |
 | `--pretty` | JSON出力をインデント付きで整形 |
-| `--svg` | 再描画したSVGの出力先。指定時は1ページ目に対して線幅キャリブレーションを実行する |
+| `--svg` | 再描画したSVGの出力先 |
 | `--linewidth-scale <float>` | 線幅補正係数を手動指定し、自動キャリブレーションをスキップする |
 | `--no-linewidth-calibration` | 自動キャリブレーションを無効化し、係数1.0(生の報告値のまま)を使用する |
 
-`--svg`実行時は、キャリブレーション結果(`scale`, `method`, `samples=実測数/候補数`, `confidence`)を標準出力に表示する。
+`-o`または`--svg`のいずれかが指定された場合、1ページ目に対して線幅キャリブレーションを実行し、結果(`scale`, `method`, `samples=実測数/候補数`, `confidence`)を標準出力に表示する。
 
-## 9. 検証方法
+### 8.1 JSON出力形式
 
-1. `uv run extract-vectors resouces/設計図-2階平面詳細図.pdf --svg output/検出線.svg`を実行し、標準出力の集計統計・キャリブレーション結果を確認する
+分類タスクがPDFを再度開かずに動作できるよう、`-o`で出力するJSONはレコードの配列だけでなく、ページ寸法とキャリブレーション結果を含むオブジェクトにしている。
+
+```json
+{
+  "page_width": 1191,
+  "page_height": 842,
+  "linewidth_scale": 0.18,
+  "records": [ { "object_type": "line", ... }, ... ]
+}
+```
+
+(旧形式は`records`配列のみのフラットなリストだったが、分類タスクとの疎結合のためこの形式に変更した。詳細は`docs/adr/0005-extract-classify-decoupling.md`)
+
+## 9. 分類タスク: 通り芯・通り芯番号 (`classify/grid.py`, `classify_cli.py`)
+
+### 9.1 概要
+
+抽出タスクのJSON出力(8.1節の形式)を読み込み、以下を分類する。
+
+- **通り芯番号(`GridLabel`)**: 丸(`curve`)の中に数字/アルファベット(またはその組み合わせ)の`char`が入ったラベル
+- **通り芯(`GridLine`)**: 通り芯番号の中心と同じ座標(水平ならy、垂直ならx)を共有する、ページの広い範囲にわたる`line`セグメントの集合
+
+判定条件(詳細・実データでの検証結果は`docs/adr/0006-grid-line-classification.md`):
+
+1. `curve`の点列(`pts`)の重心距離の相対標準偏差が小さい(≈真円)ものを円候補とする
+2. 円の中心近傍にある`char`を連結し、`^[A-Za-z]{0,3}[0-9]{0,3}$`にマッチする(かつ非空の)ラベルのみを採用する
+3. 円の中心と同じ座標を共有する`line`が、ページ寸法に対して十分な範囲(既定: 該当軸のページ寸法の10%以上)にわたって規定本数(既定: 5本)以上存在する場合のみ、その円ラベルを「通り芯番号」として確定し、該当する線分群を「通り芯」として結び付ける
+4. ラベルテキストをアルファベット接頭辞と数値部分に分解し、同じ接頭辞を持つラベル間で数値部分に重複がないか(=連番としてもっともらしいか)を`sequence_plausible`として記録する(結果への参考情報であり、判定のフィルタ条件には使わない)
+
+半径のような絶対値をハードコードせず、「妥当なラベルテキストの存在」と「対応する長い共線クラスタの存在」という2条件の組み合わせのみで判定することで、ドア把手・水栓アイコン・方位マーク等の装飾的な円との誤検出を避けている。
+
+### 9.2 データ型
+
+```python
+@dataclass(frozen=True)
+class GridLabel:
+    text: str
+    center: tuple[float, float]
+    radius: float
+    circle_index: int          # recordsリスト中のインデックス(丸のcurve)
+    char_indices: tuple[int, ...]
+
+@dataclass(frozen=True)
+class GridLine:
+    label: GridLabel
+    axis: Literal["horizontal", "vertical"]
+    coordinate: float
+    segment_indices: tuple[int, ...]  # 通り芯を構成するlineのインデックス
+    span: tuple[float, float]
+    sequence_group: str
+    sequence_number: int | None
+    sequence_plausible: bool
+```
+
+### 9.3 分類タスクCLI (`classify_cli.py`)
+
+エントリポイント: `classify-grid-lines`
+
+```
+uv run classify-grid-lines <抽出JSONパス> [-o 出力JSONパス] [--pretty] [--svg 出力SVGパス]
+```
+
+| オプション | 説明 |
+|---|---|
+| `-o, --output` | 検出した`GridLine`のリストをJSONファイルに出力 |
+| `--pretty` | JSON出力をインデント付きで整形 |
+| `--svg` | 通り芯・通り芯番号を`#ff4500`で着色した再現SVGの出力先(それ以外の要素は抽出タスクと同じ見た目で描画される) |
+
+標準出力には検出した各`GridLine`のラベル・軸・線分本数・スパン・連番妥当性を表示する。
+
+## 10. 検証方法
+
+### 抽出タスク
+
+1. `uv run extract-vectors resouces/設計図-2階平面詳細図.pdf -o output/設計図-2階平面詳細図.json --svg output/検出線.svg`を実行し、標準出力の集計統計・キャリブレーション結果、および出力JSONが8.1節の形式であることを確認する
 2. 生成されたSVGを`rsvg-convert`等でラスタライズし、`page.to_image()`で得た原本のラスタ画像と同一DPI・同一ピクセル座標で比較する
    - 太さ検証: 特定のx/y座標での水平・垂直スキャンラインを取り、連続する黒画素のラン長(px)を実測して原本と比較する
    - 回転文字検証: 斜め文字・縦書き数字の該当領域を切り出し、向き・サイズが原本と一致するか目視確認する
 3. `--no-linewidth-calibration`指定時に係数が1.0になり、自動キャリブレーション実行時と結果が異なることを確認する
 
-## 10. 今後の課題(未着手)
+### 分類タスク
 
-- 分類ロジック本体(通り芯線・寸法線・壁中心線などへの分類)の実装
+1. `uv run classify-grid-lines output/設計図-2階平面詳細図.json -o output/通り芯分類結果.json --svg output/通り芯分類.svg --pretty`を実行する
+2. 出力JSONで、`X1`/`X2`/`Y1`/`Y2`の4つの`GridLine`が検出され、装飾的な円が誤検出されていないことを確認する
+3. 出力SVGをラスタライズし、通り芯・通り芯番号(丸+文字+線)が`#ff4500`で着色され、それ以外の要素は抽出タスクと同じ見た目で再現されていることを目視確認する
+4. `classify/`配下および`classify_cli.py`のimportに`extract`や`pdfplumber`が含まれていないことを確認し、抽出タスクと分類タスクが疎結合であることを確認する
+
+## 11. 今後の課題(未着手)
+
+- 寸法線・壁中心線・引き出し線など、通り芯以外の図面要素分類の実装
 - 埋め込みフォントのSVGへの埋め込み対応(文字位置・字形の完全再現)
 - 複数ページPDFへの対応(現状CLIの`--svg`は1ページ目のみを対象)

@@ -51,18 +51,14 @@ def main(argv: list[str] | None = None) -> None:
     stats = summarize(records)
     print(json.dumps(stats, ensure_ascii=False, indent=2, default=str))
 
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        indent = 2 if args.pretty else None
-        args.output.write_text(
-            json.dumps(records, ensure_ascii=False, indent=indent, default=str),
-            encoding="utf-8",
-        )
-        print(f"wrote {len(records)} records to {args.output}")
+    need_calibration = args.output is not None or args.svg is not None
+    calib: CalibrationResult | None = None
+    page_width = page_height = None
 
-    if args.svg is not None:
+    if need_calibration:
         with pdfplumber.open(args.pdf_path) as pdf:
             page = pdf.pages[0]
+            page_width, page_height = page.width, page.height
 
             if args.linewidth_scale is not None:
                 calib = CalibrationResult(
@@ -81,7 +77,23 @@ def main(argv: list[str] | None = None) -> None:
                 f"confidence={calib.confidence:.2f})"
             )
 
-            svg = build_svg(records, page.width, page.height, linewidth_scale=calib.scale)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        indent = 2 if args.pretty else None
+        payload = {
+            "page_width": page_width,
+            "page_height": page_height,
+            "linewidth_scale": calib.scale,
+            "records": records,
+        }
+        args.output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=indent, default=str),
+            encoding="utf-8",
+        )
+        print(f"wrote {len(records)} records to {args.output}")
+
+    if args.svg is not None:
+        svg = build_svg(records, page_width, page_height, linewidth_scale=calib.scale)
         args.svg.parent.mkdir(parents=True, exist_ok=True)
         args.svg.write_text(svg, encoding="utf-8")
         print(f"wrote svg to {args.svg}")

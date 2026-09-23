@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 extract-vectors = "classifier_arch_drawing.cli:main"
+classify-grid-lines = "classifier_arch_drawing.classify_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.12,<0.12.0"]
