@@ -372,23 +372,53 @@ def prune_to_closed_loops(
 
 _EVENLY_SPACED_GAP_RATIO_TOLERANCE = 2.0  # 隣接ギャップの比率がこの倍率以内なら「ほぼ等間隔」とみなす
 _MIN_EVENLY_SPACED_RUN = 4  # 等間隔とみなすために必要な最低本数
+_MIN_LENGTH_TO_GAP_RATIO = 3.0  # 面の長さが間隔の何倍以上あればハッチングの構成要素とみなすか
+# (断熱材の蛇腹記号(短いティックマークの規則的な並び)や、家具・柱の輪郭線
+# (同一線幅・等間隔の短い線が偶然並ぶ)は、「等間隔」という座標上の条件だけ
+# では真のハッチングと区別できない。本物のハッチング(材質を表す平行線)は
+# 間隔に対して線が十分長い(部屋を横断する長さがある)のに対し、これらの
+# 誤検出要因は間隔と同程度かそれ以下の短い線であるため、この比率で区別する)
+_LENGTH_PREFILTER_RATIO_THRESHOLD = 2.5  # 線幅グループ内で「短いノイズ」と「長いハッチング候補」を分ける倍率ジャンプ閾値
+# (同一線幅グループには、真のハッチング線(長い)と無関係な短い線(家具の
+# 細部等)が混在することがある。座標順にチェーンを構築する前にこれらを
+# 分離しておかないと、真のハッチング線の間に短い線が挟まるたびにチェーンが
+# 分断され、本来1本の長いランになるはずの検出結果が大量の細切れ断片に
+# なってしまう(実データで確認済み)。チェーン構築後の`min_length_to_gap_ratio`
+# による間引きだけでは、この「分断」自体は防げないため、事前フィルタとして
+# 別途必要。なお、線幅グループの中に明確な倍率ジャンプが存在しない場合
+# (実データでは横方向のハッチング等、線幅グループ内に多様な長さの線が
+# 連続的に混在するケースがあった)は、この事前フィルタは機能せず全ての
+# 面がチェーン構築の対象になる。そのようなケースでの検出漏れは既知の
+# 制約として残る(docs/issue.md参照)。
 
 
 def find_evenly_spaced_runs(
-    faces: list[dict], ratio_tolerance: float = _EVENLY_SPACED_GAP_RATIO_TOLERANCE, min_run: int = _MIN_EVENLY_SPACED_RUN
+    faces: list[dict],
+    ratio_tolerance: float = _EVENLY_SPACED_GAP_RATIO_TOLERANCE,
+    min_run: int = _MIN_EVENLY_SPACED_RUN,
+    min_length_to_gap_ratio: float = _MIN_LENGTH_TO_GAP_RATIO,
+    length_prefilter_ratio_threshold: float = _LENGTH_PREFILTER_RATIO_THRESHOLD,
 ) -> list[list[dict]]:
     """`merge_axis_fragments`が返す面の列から、同一線幅でほぼ等間隔に並ぶ区間を検出する。
 
-    座標順に並べたとき、隣接する面同士の間隔の比率が`ratio_tolerance`以内で
-    ある限り同じランに連結し、`min_run`本以上連続したランだけを採用する
-    (ハッチングの検出に使う: 「同一線種の平行線が4本以上等間隔に並ぶ」)。
+    まず線幅グループ内の面の長さ分布から、自然な倍率ジャンプ(`split_by_relative_jump`)
+    で「短いノイズ」集団を除いた上で、座標順に並べたときに隣接する面同士の
+    間隔の比率が`ratio_tolerance`以内である限り同じランに連結する。連結後、
+    各面の長さ(`hi - lo`)がランの間隔(中央値)に対して`min_length_to_gap_ratio`
+    倍未満の面をさらに取り除き、残った面が`min_run`本以上あるランだけを
+    採用する(ハッチングの検出に使う: 「同一線種の平行線が4本以上等間隔に並ぶ」)。
     """
     by_linewidth: dict[float | None, list[dict]] = {}
     for face in faces:
         by_linewidth.setdefault(face["linewidth"], []).append(face)
 
-    runs: list[list[dict]] = []
+    raw_runs: list[list[dict]] = []
     for group in by_linewidth.values():
+        lengths = [face["hi"] - face["lo"] for face in group]
+        length_boundary = split_by_relative_jump(lengths, length_prefilter_ratio_threshold)
+        if length_boundary is not None:
+            group = [face for face in group if (face["hi"] - face["lo"]) >= length_boundary]
+
         group_sorted = sorted(group, key=lambda f: f["coord"])
         if len(group_sorted) < min_run:
             continue
@@ -406,11 +436,22 @@ def find_evenly_spaced_runs(
                 current_run.append(group_sorted[i])
             else:
                 if len(current_run) >= min_run:
-                    runs.append(current_run)
+                    raw_runs.append(current_run)
                 current_run = [group_sorted[i - 1], group_sorted[i]]
             prev_gap = gap
         if len(current_run) >= min_run:
-            runs.append(current_run)
+            raw_runs.append(current_run)
+
+    runs: list[list[dict]] = []
+    for run in raw_runs:
+        gaps = [run[i]["coord"] - run[i - 1]["coord"] for i in range(1, len(run))]
+        median_gap = statistics.median(gaps)
+        if median_gap <= 0:
+            continue
+        min_length = median_gap * min_length_to_gap_ratio
+        filtered = [face for face in run if (face["hi"] - face["lo"]) >= min_length]
+        if len(filtered) >= min_run:
+            runs.append(filtered)
 
     return runs
 
@@ -490,6 +531,36 @@ def split_by_relative_jump(values: list[float], ratio_threshold: float) -> float
         if prev > 0 and cur / prev > ratio_threshold:
             return (prev + cur) / 2
     return None
+
+
+def cluster_by_relative_jumps(values: list[float], ratio_threshold: float) -> list[list[int]]:
+    """値の列を、自然な倍率ジャンプの境界で複数のクラスタに再帰分割する。
+
+    `split_by_relative_jump`は「2群に分ける境界を1つ求める」だけだが、
+    3つ以上の自然なクラスタが存在する場合はそれぞれの境界を再帰的に
+    求める必要がある。素朴な「隣接する値同士の比率がしきい値以内なら
+    連結する」という貪欲な逐次クラスタリングは、両端が大きく乖離した値
+    同士でも中間値を介してなだらかに連結されてしまう(チェイニング)
+    という欠陥があるため、それに代わる汎用ヘルパーとして用意する。
+
+    戻り値は各クラスタに属する`values`のインデックスのリスト(値の昇順)。
+    """
+    if not values:
+        return []
+
+    def cluster(indices: list[int]) -> list[list[int]]:
+        if len(indices) <= 1:
+            return [indices]
+        sub_values = [values[i] for i in indices]
+        boundary = split_by_relative_jump(sub_values, ratio_threshold)
+        if boundary is None:
+            return [indices]
+        left = [i for i in indices if values[i] < boundary]
+        right = [i for i in indices if values[i] >= boundary]
+        return cluster(left) + cluster(right)
+
+    sorted_indices = sorted(range(len(values)), key=lambda i: values[i])
+    return cluster(sorted_indices)
 
 
 def _split_long_short(lengths: list[float]) -> float | None:

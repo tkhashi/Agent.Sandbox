@@ -386,6 +386,7 @@ def main_unread_info(argv: list[str] | None = None) -> None:
     if frame is not None:
         excluded.update(frame.border_line_indices)
         excluded.update(frame.attached_line_indices)
+        excluded.update(frame.meta_record_indices)
 
     result = classify_unread_info(records, frozenset(excluded), page_width, page_height)
 
