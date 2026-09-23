@@ -33,7 +33,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..schema import VectorRecord
-from .geometry import MIN_SPAN_RATIO, find_chain_runs, find_circles, find_touching_lines
+from .geometry import (
+    MIN_SPAN_RATIO,
+    collect_axis_aligned_lines,
+    collect_char_runs,
+    find_chain_runs,
+    find_circles,
+    find_touching_lines,
+)
 from .grid import GridLine
 
 _NUMBER_CHAR_PATTERN = re.compile(r"^[0-9,]$")
@@ -65,81 +72,14 @@ class DimensionSegment:
     is_axis_derived: bool
 
 
-def _char_orientation(record: VectorRecord) -> tuple[Literal["horizontal", "vertical"], float, float, float] | None:
-    matrix = record.get("matrix")
-    if not matrix:
-        return None
-    a, b, _c, _d, _e, _f = matrix
-    font_size = math.hypot(a, b)
-    if font_size <= 0:
-        return None
-    angle = math.degrees(math.atan2(b, a)) % 180
-    axis: Literal["horizontal", "vertical"] = "horizontal" if (angle < 45 or angle > 135) else "vertical"
-    unit_dx, unit_dy = a / font_size, -b / font_size
-    return axis, font_size, unit_dx, unit_dy
-
-
 def _collect_numeric_words(records: list[VectorRecord]) -> list[dict]:
-    candidates = []
-    for index, record in enumerate(records):
-        if record["object_type"] != "char":
-            continue
-        text = record.get("text") or ""
-        if not _NUMBER_CHAR_PATTERN.match(text):
-            continue
-        orientation = _char_orientation(record)
-        if orientation is None:
-            continue
-        axis, font_size, unit_dx, unit_dy = orientation
-        x0, x1, top, bottom = (
-            record.get("x0"),
-            record.get("x1"),
-            record.get("top"),
-            record.get("bottom"),
-        )
-        if None in (x0, x1, top, bottom):
-            continue
-        perp = (top + bottom) / 2 if axis == "horizontal" else (x0 + x1) / 2
-        reading_key = x0 * unit_dx + top * unit_dy
-        candidates.append(
-            {
-                "index": index,
-                "axis": axis,
-                "font_size": font_size,
-                "perp": perp,
-                "reading_key": reading_key,
-                "text": text,
-                "x0": x0,
-                "x1": x1,
-                "top": top,
-                "bottom": bottom,
-            }
-        )
-
-    words: list[dict] = []
-    for axis in ("horizontal", "vertical"):
-        items = sorted((c for c in candidates if c["axis"] == axis), key=lambda c: c["perp"])
-
-        perp_clusters: list[list[dict]] = []
-        for item in items:
-            if perp_clusters and abs(item["perp"] - perp_clusters[-1][-1]["perp"]) <= _COORDINATE_TOLERANCE:
-                perp_clusters[-1].append(item)
-            else:
-                perp_clusters.append([item])
-
-        for cluster in perp_clusters:
-            cluster.sort(key=lambda c: c["reading_key"])
-            run: list[dict] = [cluster[0]]
-            for prev, cur in zip(cluster, cluster[1:]):
-                gap = cur["reading_key"] - prev["reading_key"]
-                threshold = max(prev["font_size"], cur["font_size"]) * _WORD_CHAR_GAP_FACTOR
-                if gap > threshold:
-                    words.append(_finalize_word(run, axis))
-                    run = [cur]
-                else:
-                    run.append(cur)
-            words.append(_finalize_word(run, axis))
-
+    runs = collect_char_runs(
+        records,
+        lambda text: bool(_NUMBER_CHAR_PATTERN.match(text)),
+        perp_tolerance=_COORDINATE_TOLERANCE,
+        gap_factor=_WORD_CHAR_GAP_FACTOR,
+    )
+    words = [_finalize_word(run, run[0]["axis"]) for run in runs]
     return [w for w in words if w is not None]
 
 
@@ -163,43 +103,6 @@ def _finalize_word(run: list[dict], axis: Literal["horizontal", "vertical"]) -> 
         "along_hi": max(xs) if axis == "horizontal" else max(tops),
         "perp": sum(item["perp"] for item in run) / len(run),
     }
-
-
-def _collect_aligned_lines(records: list[VectorRecord]) -> dict[str, list[dict]]:
-    out: dict[str, list[dict]] = {"horizontal": [], "vertical": []}
-    for index, record in enumerate(records):
-        if record["object_type"] != "line":
-            continue
-        x0, x1, top, bottom = (
-            record.get("x0"),
-            record.get("x1"),
-            record.get("top"),
-            record.get("bottom"),
-        )
-        if None in (x0, x1, top, bottom):
-            continue
-        linewidth = record.get("linewidth")
-        if abs(top - bottom) <= _AXIS_ALIGN_TOLERANCE:
-            out["horizontal"].append(
-                {
-                    "index": index,
-                    "coord": (top + bottom) / 2,
-                    "lo": min(x0, x1),
-                    "hi": max(x0, x1),
-                    "linewidth": linewidth,
-                }
-            )
-        elif abs(x0 - x1) <= _AXIS_ALIGN_TOLERANCE:
-            out["vertical"].append(
-                {
-                    "index": index,
-                    "coord": (x0 + x1) / 2,
-                    "lo": min(top, bottom),
-                    "hi": max(top, bottom),
-                    "linewidth": linewidth,
-                }
-            )
-    return out
 
 
 def _build_networks(items: list[dict]) -> list[dict]:
@@ -334,7 +237,7 @@ def classify_dimension_lines(
     page_height: float | None = None,
 ) -> list[DimensionSegment]:
     words = _collect_numeric_words(records)
-    aligned = _collect_aligned_lines(records)
+    aligned = collect_axis_aligned_lines(records)
 
     networks_by_axis = {
         axis: _build_networks(aligned[axis]) for axis in ("horizontal", "vertical")

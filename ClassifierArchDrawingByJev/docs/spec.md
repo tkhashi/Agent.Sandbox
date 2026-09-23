@@ -133,6 +133,20 @@ class CalibrationResult:
 
 - SVGは実際の埋め込みフォント(`AAAAAB+font0000000030638abc`等)ではなく代替フォント(`font-family="sans-serif"`)で描画している。そのため、グリフの字形・字送り幅が原本と完全には一致せず、通り芯番号などの文字位置にわずかな残差が残る。フォント埋め込み対応は別タスクとして保留している。
 
+### 7.4 面の塗りつぶし(`FillPolygon`)
+
+壁分類(13章)のような、スコアに応じたグラデーション塗りつぶしを表現するため、`build_svg`は`fill_polygons: list[FillPolygon] | None = None`という追加引数を持つ(デフォルト`None`で既存呼び出しは無変更)。
+
+```python
+@dataclass(frozen=True)
+class FillPolygon:
+    points: tuple[tuple[float, float], ...]
+    color: str
+    opacity: float = 0.5
+```
+
+`fill_polygons`が指定された場合、通常のstroke描画の後に`<polygon fill="{color}" fill-opacity="{opacity}">`要素を追加描画する。`render.py`は「ポリゴン+色+不透明度」のみを扱い、それが何を表すか(壁のスコア等)は一切関知しない(`highlight_indices`と同じ責務分離)。スコア値から色への変換は`_gradient_color(score_ratio, low_color, high_color)`が担い、RGB各チャンネルを線形補間する。スコア→比率(0〜1)への変換は呼び出し側(`classify_cli.py`)の責務。
+
 ## 8. 抽出タスクCLI (`cli.py`)
 
 エントリポイント: `extract-vectors`(`pyproject.toml`の`[project.scripts]`で定義)
@@ -281,7 +295,79 @@ uv run classify-dimension-lines <抽出JSONパス> [-o 出力JSONパス] [--pret
 
 標準出力には検出した各`DimensionSegment`の数値・軸・始終点・通り芯由来かどうかを表示する。
 
-## 11. 検証方法
+## 11. 分類タスク: 壁(内壁) (`classify/wall.py`, `classify_cli.py`)
+
+### 11.1 概要
+
+抽出タスクのJSON出力を読み込み、内壁(外壁は対象外)を分類する。内部で`classify_grid_lines`・`classify_dimension_lines`を自動実行し、通り芯・寸法線を壁候補から除外した上で、寸法線との位置関係をスコアの一根拠として使う。
+
+壁は図面の詳細度によって描き方が変わり、通り芯・寸法線のような決定的な条件だけでは判定しきれないため、**候補生成(Phase A)+スコアリング(Phase B)**の2段構成を取る(詳細・実データでの検証結果・既知の制約は`docs/adr/0008-wall-classification.md`を参照)。
+
+**候補生成**:
+
+1. 軸並行(水平/垂直)の`line`を線幅ごとにグループ化し、同一座標に密集する断片を1本の「面」にまとめる
+2. 通り芯・寸法線を構成する`line`は候補から除外する
+3. 各面を、座標が大きい側で最初に条件(同一線幅・十分な重なり・壁厚として妥当な間隔)を満たす面と**nearest-neighbor方式で1対1にペア化**する(`WallPairSegment`)
+4. 壁厚の上限は、ページ対角線比の粗い上限と、間隔分布の自然な倍率ジャンプの両方で絞り込む
+5. 「壁は必ず閉じた直線(部屋を一周する輪郭)に囲まれている」という制約を、センターライン端点グラフに対する**leaf-pruning(2-core抽出)**として適用し、他の候補と繋がって閉ループを構成しない(行き止まりの)候補を除外する
+6. 閉ループを構成する候補を、方向転換を許容して連結し`WallRun`とする
+
+**スコアリング**(`WallRun`ごとに加点、詳細はADR0008):
+
+- `dimension_symmetry`: 寸法線の中心点、または端部からの直交方向仮想延長線とセンターラインが一致するか
+- `room_enclosure`: 部屋名文字列(「室」「ルーム」「トイレ」「便所」「オフィス」「ホール」「廊下」「場」「エリア」「PS」「EPS」等)から四方にレイキャストしてヒットするか
+- `door_adjacency`: ドア記号(開いた円弧、`find_arcs`)の中心が壁センターライン付近にあるか(**本PDFでは実質機能していない。既知の制約参照**)
+- `wall_label`: 壁符号(「W1」等)・「壁」という文字列が近傍にあるか
+- `parallel_continuity`: 連続長・厚みの安定性(候補生成の基準でもある)
+
+合計スコアが、スコア分布の自然な倍率ジャンプから導出した閾値(境界が見つからない場合はフォールバック定数)以上であれば壁と判定する。
+
+### 11.2 データ型
+
+```python
+@dataclass(frozen=True)
+class WallPairSegment:
+    axis: Literal["horizontal", "vertical"]
+    coordinate_a: float
+    coordinate_b: float
+    lo: float
+    hi: float
+    line_indices_a: tuple[int, ...]
+    line_indices_b: tuple[int, ...]
+    linewidth: float | None
+    thickness: float
+
+@dataclass(frozen=True)
+class WallRun:
+    segments: tuple[WallPairSegment, ...]
+    line_indices: tuple[int, ...]
+    polygon: tuple[tuple[float, float], ...]
+    score: float
+    score_components: dict[str, float]
+    is_wall: bool
+```
+
+### 11.3 分類タスクCLI
+
+エントリポイント: `classify-wall-lines`
+
+```
+uv run classify-wall-lines <抽出JSONパス> [-o 出力JSONパス] [--pretty] [--svg 出力SVGパス]
+```
+
+| オプション | 説明 |
+|---|---|
+| `-o, --output` | 検出した`WallRun`(`is_wall=True`のみ)のリストをJSONファイルに出力 |
+| `--pretty` | JSON出力をインデント付きで整形 |
+| `--svg` | 壁候補をスコアに応じたグラデーション(低: `#66cdaa` 〜 高: `#ff69b4`、不透明度50%)で塗りつぶした再現SVGの出力先 |
+
+標準出力には検出した各`WallRun`のスコア・スコア内訳・構成セグメント数を表示する。
+
+### 11.4 既知の制約(初版・2026-09-23時点)
+
+このタスクは通り芯・寸法線分類と異なり、実データでの精度検証が途上である。**再現率(検出漏れ)が低いことが判明している**(本PDFでの検証では、閉ループ制約により誤検出は解消できたが、壁候補953件中、最終的に壁と判定されたのは6件のみで、明らかに壁と分かる建物外周・室内間仕切りの大半を検出できていない)。またドア記号検出(`find_arcs`)は本PDFでは装飾的な小さい円弧しか検出できず、実質機能していない。詳細な原因分析・今後の改善方針は`docs/adr/0008-wall-classification.md`の「既知の制約」節を参照。
+
+## 12. 検証方法
 
 ### 抽出タスク
 
@@ -300,9 +386,17 @@ uv run classify-dimension-lines <抽出JSONパス> [-o 出力JSONパス] [--pret
 5. `uv run classify-dimension-lines output/設計図-2階平面詳細図.json -o output/寸法線分類結果.json --svg output/寸法線分類.svg --pretty`を実行し、主要な寸法チェーン(例: 上辺の「3,700/1,800/2,900/1,200」、下辺の「950/1,900/1,750/1,900/1,900」等)が正しい数値・`is_axis_derived`で検出されることを確認する
 6. 出力SVGをラスタライズし、寸法線(実線・端部の丸・伸びる線)が`#008000`で着色され、それ以外の要素(壁・通り芯・テキスト等)は従来通り再現されていることを目視確認する
 
-## 12. 今後の課題(未着手)
+### 壁分類
 
-- 壁中心線・引き出し線・扉開閉境界の円弧など、通り芯・寸法線以外の図面要素分類の実装
+1. `uv run classify-wall-lines output/設計図-2階平面詳細図.json -o output/壁分類結果.json --svg output/壁分類.svg --pretty`を実行する
+2. 出力SVGをラスタライズし、フローリング材のハッチング・通り芯・寸法線が壁として誤って塗りつぶされていないことを確認する(誤検出防止は検証済み。検出漏れが多いことは既知の制約として11.4節に記載)
+3. `classify-grid-lines`/`classify-dimension-lines`を再実行し、`geometry.py`の共通ヘルパー化(`collect_axis_aligned_lines`, `collect_char_runs`, `split_by_relative_jump`)により既存の検出結果(通り芯4本、寸法線36件)が変化していないことを確認する
+
+## 13. 今後の課題(未着手)
+
+- **壁分類の再現率向上**: 壁候補のnearest-neighborペア化が、実際の壁の対向面に到達する前に装飾的なtick線・仕上げ表現に阻まれるケースが多く、検出漏れが多い(詳細は`docs/adr/0008-wall-classification.md`)。次回優先して取り組むべき課題
+- **ドア記号(扇形)検出の実データ検証**: `find_arcs`は円フィット自体は機能するが、本PDFでは装飾的な小さい円弧しか検出できていない
+- 引き出し線等、通り芯・寸法線・壁以外の図面要素分類の実装
 - 寸法線分類の閾値(`_WORD_TO_LINE_GAP_FACTOR`等)は本PDFで経験的に調整した値であり、他のPDFでの再調整が必要になる可能性がある
 - 埋め込みフォントのSVGへの埋め込み対応(文字位置・字形の完全再現)
 - 複数ページPDFへの対応(現状CLIの`--svg`は1ページ目のみを対象)

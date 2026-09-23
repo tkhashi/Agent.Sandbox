@@ -14,10 +14,14 @@ from pathlib import Path
 
 from .classify.dimension import classify_dimension_lines
 from .classify.grid import classify_grid_lines
-from .render import build_svg
+from .classify.wall import classify_wall_lines
+from .render import FillPolygon, _gradient_color, build_svg
 
 _GRID_HIGHLIGHT_COLOR = "#ff4500"
 _DIMENSION_HIGHLIGHT_COLOR = "#008000"
+_WALL_SCORE_LOW_COLOR = (0x66, 0xCD, 0xAA)
+_WALL_SCORE_HIGH_COLOR = (0xFF, 0x69, 0xB4)
+_WALL_FILL_OPACITY = 0.5
 
 
 def _load_payload(input_json: Path) -> dict:
@@ -39,8 +43,9 @@ def _write_svg(
     page_width: float,
     page_height: float,
     linewidth_scale: float,
-    highlight_indices: set[int],
-    highlight_color: str,
+    highlight_indices: set[int] | None = None,
+    highlight_color: str = "#ff4500",
+    fill_polygons: list[FillPolygon] | None = None,
 ) -> None:
     svg = build_svg(
         records,
@@ -49,6 +54,7 @@ def _write_svg(
         linewidth_scale=linewidth_scale,
         highlight_indices=highlight_indices,
         highlight_color=highlight_color,
+        fill_polygons=fill_polygons,
     )
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     svg_path.write_text(svg, encoding="utf-8")
@@ -178,6 +184,82 @@ def main_dimension(argv: list[str] | None = None) -> None:
             linewidth_scale,
             highlight_indices,
             _DIMENSION_HIGHLIGHT_COLOR,
+        )
+        print(f"wrote svg to {args.svg}")
+
+
+def _parse_wall_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="抽出済みベクターデータから壁(内壁)をスコアリング方式で分類する"
+    )
+    parser.add_argument("input_json", type=Path, help="extract-vectorsが出力したJSON")
+    parser.add_argument("-o", "--output", type=Path, default=None, help="分類結果JSONの出力先")
+    parser.add_argument("--pretty", action="store_true", help="JSON出力をインデント付きで整形する")
+    parser.add_argument(
+        "--svg",
+        type=Path,
+        default=None,
+        help=(
+            f"壁候補をスコアに応じたグラデーション("
+            f"低: rgb{_WALL_SCORE_LOW_COLOR} 〜 高: rgb{_WALL_SCORE_HIGH_COLOR}、"
+            f"不透明度{_WALL_FILL_OPACITY})で塗りつぶした再現SVGの出力先"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main_wall(argv: list[str] | None = None) -> None:
+    """`classify-wall-lines`のエントリポイント。
+
+    通り芯分類・寸法線分類は内部で自動的に実行する(壁の判定条件の一つに
+    寸法線との位置関係を使うため)。
+    """
+    args = _parse_wall_args(argv)
+
+    payload = _load_payload(args.input_json)
+    page_width = payload["page_width"]
+    page_height = payload["page_height"]
+    linewidth_scale = payload["linewidth_scale"]
+    records = payload["records"]
+
+    grid_lines = classify_grid_lines(records, page_width, page_height)
+    dimension_segments = classify_dimension_lines(records, grid_lines, page_width, page_height)
+    wall_runs = classify_wall_lines(records, dimension_segments, grid_lines, page_width, page_height)
+
+    walls = [w for w in wall_runs if w.is_wall]
+    print(f"detected {len(walls)} wall run(s) (of {len(wall_runs)} candidate(s)):")
+    for wall in walls:
+        print(
+            f"  score={wall.score:.2f} segments={len(wall.segments)} "
+            f"components={wall.score_components}"
+        )
+
+    if args.output is not None:
+        _write_json(args.output, args.pretty, [asdict(w) for w in walls])
+        print(f"wrote {len(walls)} wall run(s) to {args.output}")
+
+    if args.svg is not None:
+        scores = [w.score for w in walls]
+        lo, hi = (min(scores), max(scores)) if scores else (0.0, 1.0)
+        fill_polygons = [
+            FillPolygon(
+                points=w.polygon,
+                color=_gradient_color(
+                    0.5 if hi == lo else (w.score - lo) / (hi - lo),
+                    low_color=_WALL_SCORE_LOW_COLOR,
+                    high_color=_WALL_SCORE_HIGH_COLOR,
+                ),
+                opacity=_WALL_FILL_OPACITY,
+            )
+            for w in walls
+        ]
+        _write_svg(
+            args.svg,
+            records,
+            page_width,
+            page_height,
+            linewidth_scale,
+            fill_polygons=fill_polygons,
         )
         print(f"wrote svg to {args.svg}")
 

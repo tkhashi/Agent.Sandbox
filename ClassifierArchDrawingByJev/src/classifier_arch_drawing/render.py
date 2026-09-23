@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 from .schema import VectorRecord
@@ -150,6 +151,33 @@ def _record_to_svg_element(
     return None
 
 
+@dataclass(frozen=True)
+class FillPolygon:
+    """スコアリング等、線の再描画とは独立に面を塗りたい場合に使う塗りつぶしポリゴン。
+
+    `render.py`は「ポリゴン+色+不透明度」だけを知り、そのポリゴンが何を
+    表すか(壁のスコア等)は呼び出し側(分類タスクのCLI)の責務とする
+    (`highlight_indices`と同じ責務分離の考え方)。
+    """
+
+    points: tuple[tuple[float, float], ...]
+    color: str
+    opacity: float = 0.5
+
+
+def _gradient_color(
+    score_ratio: float,
+    low_color: tuple[int, int, int] = (0x66, 0xCD, 0xAA),
+    high_color: tuple[int, int, int] = (0xFF, 0x69, 0xB4),
+) -> str:
+    """スコア比率(0〜1)からlow_color〜high_colorへの線形補間で色文字列を返す。"""
+    ratio = max(0.0, min(1.0, score_ratio))
+    r = round(low_color[0] + (high_color[0] - low_color[0]) * ratio)
+    g = round(low_color[1] + (high_color[1] - low_color[1]) * ratio)
+    b = round(low_color[2] + (high_color[2] - low_color[2]) * ratio)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def build_svg(
     records: list[VectorRecord],
     page_width: float,
@@ -158,6 +186,7 @@ def build_svg(
     linewidth_scale: float = 1.0,
     highlight_indices: set[int] | None = None,
     highlight_color: str = "#ff4500",
+    fill_polygons: list[FillPolygon] | None = None,
 ) -> str:
     elements: list[str] = []
     for index, record in enumerate(records):
@@ -171,11 +200,21 @@ def build_svg(
             elements.append(element)
 
     body = "\n".join(elements)
+
+    fill_body = ""
+    if fill_polygons:
+        fill_elements = [
+            f'<polygon points="{_points_to_polyline_points(list(fp.points))}" '
+            f'fill="{fp.color}" fill-opacity="{fp.opacity}" stroke="none" />'
+            for fp in fill_polygons
+        ]
+        fill_body = "\n" + "\n".join(fill_elements)
+
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'width="{page_width:.3f}" height="{page_height:.3f}" '
         f'viewBox="0 0 {page_width:.3f} {page_height:.3f}">\n'
         f'<rect x="0" y="0" width="{page_width:.3f}" height="{page_height:.3f}" fill="white" />\n'
-        f"{body}\n"
+        f"{body}{fill_body}\n"
         f"</svg>\n"
     )
