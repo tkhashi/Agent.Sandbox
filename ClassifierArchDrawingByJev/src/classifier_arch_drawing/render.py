@@ -87,10 +87,12 @@ def _record_to_svg_element(
     page_height: float,
     highlight: bool = False,
     highlight_color: str = "#ff4500",
+    override_color: str | None = None,
 ) -> str | None:
     object_type = record["object_type"]
     linewidth = _effective_linewidth(record.get("linewidth"), linewidth_scale)
-    stroke = highlight_color if highlight else _color_to_css(record.get("stroking_color"), _DEFAULT_STROKE)
+    effective_color = override_color if override_color is not None else (highlight_color if highlight else None)
+    stroke = effective_color if effective_color is not None else _color_to_css(record.get("stroking_color"), _DEFAULT_STROKE)
 
     if object_type in ("line", "rect"):
         pts = record.get("pts")
@@ -123,7 +125,7 @@ def _record_to_svg_element(
         text = record.get("text")
         if not text or text.isspace():
             return None
-        fill = highlight_color if highlight else _color_to_css(record.get("non_stroking_color"), _DEFAULT_FILL)
+        fill = effective_color if effective_color is not None else _color_to_css(record.get("non_stroking_color"), _DEFAULT_FILL)
         escaped = (
             text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         )
@@ -187,14 +189,16 @@ def build_svg(
     highlight_indices: set[int] | None = None,
     highlight_color: str = "#ff4500",
     fill_polygons: list[FillPolygon] | None = None,
+    color_overrides: dict[int, str] | None = None,
 ) -> str:
     elements: list[str] = []
     for index, record in enumerate(records):
         if record["object_type"] not in object_types:
             continue
         highlight = highlight_indices is not None and index in highlight_indices
+        override_color = color_overrides.get(index) if color_overrides is not None else None
         element = _record_to_svg_element(
-            record, linewidth_scale, page_height, highlight, highlight_color
+            record, linewidth_scale, page_height, highlight, highlight_color, override_color
         )
         if element is not None:
             elements.append(element)

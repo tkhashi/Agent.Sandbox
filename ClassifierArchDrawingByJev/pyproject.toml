@@ -18,6 +18,7 @@ classify-grid-lines = "classifier_arch_drawing.classify_cli:main"
 classify-dimension-lines = "classifier_arch_drawing.classify_cli:main_dimension"
 classify-wall-lines = "classifier_arch_drawing.classify_cli:main_wall"
 classify-drawing-frame = "classifier_arch_drawing.classify_cli:main_frame"
+classify-unread-info = "classifier_arch_drawing.classify_cli:main_unread_info"
 
 [build-system]
 requires = ["uv_build>=0.11.12,<0.12.0"]

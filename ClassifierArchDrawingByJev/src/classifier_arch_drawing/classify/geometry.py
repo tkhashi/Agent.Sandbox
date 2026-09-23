@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -259,6 +260,157 @@ def collect_char_runs(
                 else:
                     run.append(cur)
             runs.append(run)
+
+    return runs
+
+
+_MERGE_GAP_TOLERANCE_DEFAULT = 0.75  # pt。同一座標・同一線幅の断片を1本の面としてまとめる際の既定許容ギャップ
+
+
+def merge_axis_fragments(items: list[dict], gap_tolerance: float = _MERGE_GAP_TOLERANCE_DEFAULT) -> list[dict]:
+    """同じ座標・同じ線幅を共有し、隣接(タッチ/重なり)する線分断片を1本の「面」にまとめる。
+
+    `collect_axis_aligned_lines`が返す`{"index","coord","lo","hi","linewidth"}`形式の
+    候補リストを入力にする。通り芯の一点鎖線のように、同一座標に大量の短い
+    断片が並ぶケースをそのまま総当たりで扱うと組み合わせ爆発を起こすため、
+    まずこの前処理で断片数を大幅に減らす(壁分類・不要情報分類の両方が使う
+    共通の前処理)。
+    """
+    items_sorted = sorted(items, key=lambda i: i["coord"])
+    coord_clusters: list[list[dict]] = []
+    for item in items_sorted:
+        if coord_clusters and abs(item["coord"] - coord_clusters[-1][-1]["coord"]) <= _COORDINATE_TOLERANCE:
+            coord_clusters[-1].append(item)
+        else:
+            coord_clusters.append([item])
+
+    faces: list[dict] = []
+    for cluster in coord_clusters:
+        coord = sum(i["coord"] for i in cluster) / len(cluster)
+        by_linewidth: dict[float | None, list[dict]] = {}
+        for item in cluster:
+            by_linewidth.setdefault(item["linewidth"], []).append(item)
+        for linewidth, group in by_linewidth.items():
+            group.sort(key=lambda i: i["lo"])
+            run = [group[0]]
+            run_hi = group[0]["hi"]
+            for item in group[1:]:
+                if item["lo"] - run_hi <= gap_tolerance:
+                    run.append(item)
+                    run_hi = max(run_hi, item["hi"])
+                else:
+                    faces.append(
+                        {
+                            "coord": coord,
+                            "lo": min(i["lo"] for i in run),
+                            "hi": run_hi,
+                            "linewidth": linewidth,
+                            "indices": tuple(i["index"] for i in run),
+                        }
+                    )
+                    run = [item]
+                    run_hi = item["hi"]
+            faces.append(
+                {
+                    "coord": coord,
+                    "lo": min(i["lo"] for i in run),
+                    "hi": run_hi,
+                    "linewidth": linewidth,
+                    "indices": tuple(i["index"] for i in run),
+                }
+            )
+    return faces
+
+
+def prune_to_closed_loops(
+    edges: list[tuple[tuple[float, float], tuple[float, float]]], tolerance: float
+) -> list[bool]:
+    """端点ペアの列を、他の辺と繋がって閉路を構成しない(行き止まりの)辺を除いた生存マスクとして返す。
+
+    各辺の両端点をグラフのノードとみなし、次数1のノード(行き止まり端点)を
+    持つ辺を繰り返し取り除く(leaf-pruning、いわゆる2-core抽出)。最終的に
+    残る辺は、必ず何らかの閉路の一部になっている。壁分類(閉じた輪郭のみを
+    壁とみなす)・不要情報分類(点線で閉じた輪郭のみを対象とする)の両方が
+    使う共通のグラフアルゴリズム。
+    """
+    if not edges:
+        return []
+
+    def node_id(point: tuple[float, float]) -> tuple[int, int]:
+        return (round(point[0] / tolerance), round(point[1] / tolerance))
+
+    edge_nodes: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    incident: dict[tuple[int, int], list[int]] = {}
+    degree: dict[tuple[int, int], int] = {}
+    for a, b in edges:
+        na, nb = node_id(a), node_id(b)
+        edge_nodes.append((na, nb))
+        incident.setdefault(na, []).append(len(edge_nodes) - 1)
+        incident.setdefault(nb, []).append(len(edge_nodes) - 1)
+        degree[na] = degree.get(na, 0) + 1
+        degree[nb] = degree.get(nb, 0) + 1
+
+    removed = [False] * len(edges)
+    queue: deque[tuple[int, int]] = deque(node for node, d in degree.items() if d <= 1)
+    while queue:
+        node = queue.popleft()
+        if degree.get(node, 0) > 1:
+            continue
+        for edge_index in incident.get(node, []):
+            if removed[edge_index]:
+                continue
+            removed[edge_index] = True
+            na, nb = edge_nodes[edge_index]
+            other = nb if node == na else na
+            degree[node] -= 1
+            degree[other] -= 1
+            if degree[other] <= 1:
+                queue.append(other)
+
+    return [not r for r in removed]
+
+
+_EVENLY_SPACED_GAP_RATIO_TOLERANCE = 2.0  # 隣接ギャップの比率がこの倍率以内なら「ほぼ等間隔」とみなす
+_MIN_EVENLY_SPACED_RUN = 4  # 等間隔とみなすために必要な最低本数
+
+
+def find_evenly_spaced_runs(
+    faces: list[dict], ratio_tolerance: float = _EVENLY_SPACED_GAP_RATIO_TOLERANCE, min_run: int = _MIN_EVENLY_SPACED_RUN
+) -> list[list[dict]]:
+    """`merge_axis_fragments`が返す面の列から、同一線幅でほぼ等間隔に並ぶ区間を検出する。
+
+    座標順に並べたとき、隣接する面同士の間隔の比率が`ratio_tolerance`以内で
+    ある限り同じランに連結し、`min_run`本以上連続したランだけを採用する
+    (ハッチングの検出に使う: 「同一線種の平行線が4本以上等間隔に並ぶ」)。
+    """
+    by_linewidth: dict[float | None, list[dict]] = {}
+    for face in faces:
+        by_linewidth.setdefault(face["linewidth"], []).append(face)
+
+    runs: list[list[dict]] = []
+    for group in by_linewidth.values():
+        group_sorted = sorted(group, key=lambda f: f["coord"])
+        if len(group_sorted) < min_run:
+            continue
+
+        current_run = [group_sorted[0]]
+        prev_gap: float | None = None
+        for i in range(1, len(group_sorted)):
+            gap = group_sorted[i]["coord"] - group_sorted[i - 1]["coord"]
+            similar = (
+                prev_gap is not None
+                and prev_gap > 0
+                and (1 / ratio_tolerance) <= (gap / prev_gap) <= ratio_tolerance
+            )
+            if prev_gap is None or similar:
+                current_run.append(group_sorted[i])
+            else:
+                if len(current_run) >= min_run:
+                    runs.append(current_run)
+                current_run = [group_sorted[i - 1], group_sorted[i]]
+            prev_gap = gap
+        if len(current_run) >= min_run:
+            runs.append(current_run)
 
     return runs
 

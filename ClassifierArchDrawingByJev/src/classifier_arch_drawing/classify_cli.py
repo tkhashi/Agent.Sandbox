@@ -15,6 +15,7 @@ from pathlib import Path
 from .classify.dimension import classify_dimension_lines
 from .classify.frame import classify_drawing_frame
 from .classify.grid import classify_grid_lines
+from .classify.unread_info import classify_unread_info
 from .classify.wall import classify_wall_lines
 from .render import FillPolygon, _gradient_color, build_svg
 
@@ -24,6 +25,10 @@ _WALL_SCORE_LOW_COLOR = (0x66, 0xCD, 0xAA)
 _WALL_SCORE_HIGH_COLOR = (0xFF, 0x69, 0xB4)
 _WALL_FILL_OPACITY = 0.5
 _FRAME_HIGHLIGHT_COLOR = "#ff00ff"
+_DOOR_COLOR = "#ffa500"
+_DASHED_LOOP_COLOR = "#999999"
+_HATCH_LOW_COLOR = (0xFF, 0x7F, 0x7F)
+_HATCH_HIGH_COLOR = (0xBF, 0xFF, 0x7F)
 
 
 def _load_payload(input_json: Path) -> dict:
@@ -48,6 +53,7 @@ def _write_svg(
     highlight_indices: set[int] | None = None,
     highlight_color: str = "#ff4500",
     fill_polygons: list[FillPolygon] | None = None,
+    color_overrides: dict[int, str] | None = None,
 ) -> None:
     svg = build_svg(
         records,
@@ -57,6 +63,7 @@ def _write_svg(
         highlight_indices=highlight_indices,
         highlight_color=highlight_color,
         fill_polygons=fill_polygons,
+        color_overrides=color_overrides,
     )
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     svg_path.write_text(svg, encoding="utf-8")
@@ -323,6 +330,106 @@ def main_frame(argv: list[str] | None = None) -> None:
             linewidth_scale,
             highlight_indices,
             _FRAME_HIGHLIGHT_COLOR,
+        )
+        print(f"wrote svg to {args.svg}")
+
+
+def _parse_unread_info_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="抽出済みベクターデータから読み取り不要な情報(点線閉ループ・ハッチング・扉)を分類する"
+    )
+    parser.add_argument("input_json", type=Path, help="extract-vectorsが出力したJSON")
+    parser.add_argument("-o", "--output", type=Path, default=None, help="分類結果JSONの出力先")
+    parser.add_argument("--pretty", action="store_true", help="JSON出力をインデント付きで整形する")
+    parser.add_argument(
+        "--svg",
+        type=Path,
+        default=None,
+        help=(
+            f"扉を{_DOOR_COLOR}、点線閉ループを{_DASHED_LOOP_COLOR}、"
+            f"ハッチングをグループごとのグラデーション("
+            f"rgb{_HATCH_LOW_COLOR}〜rgb{_HATCH_HIGH_COLOR})で着色した再現SVGの出力先"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main_unread_info(argv: list[str] | None = None) -> None:
+    """`classify-unread-info`のエントリポイント。
+
+    通り芯・寸法線・壁・図面枠の分類は内部で自動的に実行し、それらの
+    分類結果に含まれるレコードは不要情報の検出対象から除外する。
+    """
+    args = _parse_unread_info_args(argv)
+
+    payload = _load_payload(args.input_json)
+    page_width = payload["page_width"]
+    page_height = payload["page_height"]
+    linewidth_scale = payload["linewidth_scale"]
+    records = payload["records"]
+
+    grid_lines = classify_grid_lines(records, page_width, page_height)
+    dimension_segments = classify_dimension_lines(records, grid_lines, page_width, page_height)
+    wall_runs = classify_wall_lines(records, dimension_segments, grid_lines, page_width, page_height)
+    frame = classify_drawing_frame(records, page_width, page_height)
+
+    excluded: set[int] = set()
+    for grid_line in grid_lines:
+        excluded.update(grid_line.segment_indices)
+    for segment in dimension_segments:
+        excluded.update(segment.line_indices)
+        excluded.update(segment.start_extension_indices)
+        excluded.update(segment.end_extension_indices)
+    for wall_run in wall_runs:
+        if wall_run.is_wall:
+            excluded.update(wall_run.line_indices)
+    if frame is not None:
+        excluded.update(frame.border_line_indices)
+        excluded.update(frame.attached_line_indices)
+
+    result = classify_unread_info(records, frozenset(excluded), page_width, page_height)
+
+    print(f"detected {len(result.dashed_closed_loops)} dashed closed loop(s)")
+    print(f"detected {len(result.doors)} door symbol(s)")
+    print(f"detected {len(result.hatch_groups)} hatch group(s):")
+    for group in result.hatch_groups:
+        print(
+            f"  group_id={group.group_id} linewidth={group.linewidth} gap={group.gap:.2f} "
+            f"instances={len(group.instances)} lines={len(group.line_indices)}"
+        )
+
+    if args.output is not None:
+        serializable = {
+            "dashed_closed_loops": [asdict(loop) for loop in result.dashed_closed_loops],
+            "doors": [asdict(door) for door in result.doors],
+            "hatch_groups": [asdict(group) for group in result.hatch_groups],
+        }
+        _write_json(args.output, args.pretty, serializable)
+        print(f"wrote unread info to {args.output}")
+
+    if args.svg is not None:
+        color_overrides: dict[int, str] = {}
+        for loop in result.dashed_closed_loops:
+            for index in loop.line_indices:
+                color_overrides[index] = _DASHED_LOOP_COLOR
+        for door in result.doors:
+            color_overrides[door.arc_index] = _DOOR_COLOR
+
+        hatch_groups = result.hatch_groups
+        n_groups = len(hatch_groups)
+        for i, group in enumerate(hatch_groups):
+            ratio = i / (n_groups - 1) if n_groups > 1 else 0.0
+            color = _gradient_color(ratio, low_color=_HATCH_LOW_COLOR, high_color=_HATCH_HIGH_COLOR)
+            for index in group.line_indices:
+                color_overrides[index] = color
+
+        _write_svg(
+            args.svg,
+            records,
+            page_width,
+            page_height,
+            linewidth_scale,
+            color_overrides=color_overrides,
         )
         print(f"wrote svg to {args.svg}")
 

@@ -10,6 +10,14 @@ from __future__ import annotations
 from .dimension import DimensionSegment, classify_dimension_lines
 from .frame import DrawingFrame, classify_drawing_frame
 from .grid import GridLabel, GridLine, classify_grid_lines
+from .unread_info import (
+    DashedClosedLoop,
+    DoorSymbol,
+    HatchGroup,
+    HatchInstance,
+    UnreadInfoResult,
+    classify_unread_info,
+)
 from .wall import WallPairSegment, WallRun, classify_wall_lines
 
 __all__ = [
@@ -23,4 +31,10 @@ __all__ = [
     "classify_wall_lines",
     "DrawingFrame",
     "classify_drawing_frame",
+    "DashedClosedLoop",
+    "DoorSymbol",
+    "HatchGroup",
+    "HatchInstance",
+    "UnreadInfoResult",
+    "classify_unread_info",
 ]

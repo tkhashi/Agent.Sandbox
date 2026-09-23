@@ -29,7 +29,6 @@ from __future__ import annotations
 import math
 import re
 import statistics
-from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
@@ -39,6 +38,8 @@ from .geometry import (
     collect_axis_aligned_lines,
     collect_char_runs,
     find_arcs,
+    merge_axis_fragments,
+    prune_to_closed_loops,
     split_by_relative_jump,
 )
 from .grid import GridLine
@@ -127,61 +128,6 @@ class WallRun:
     is_wall: bool
 
 
-def _merge_axis_faces(items: list[dict]) -> list[dict]:
-    """同じ座標・同じ線幅を共有し、隣接(タッチ/重なり)する線分断片を1本の「面」にまとめる。
-
-    通り芯の一点鎖線のように、同一座標に大量の短い断片が並ぶケースを
-    そのまま総当たりでペア化すると組み合わせ爆発を起こすため、まず
-    この前処理で断片数を大幅に減らす(`dimension._build_networks`と
-    同様の考え方だが、壁面探索では隙間の許容値を`_MERGE_GAP_TOLERANCE`
-    (タッチ判定相当)に留め、一点鎖線特有の大きな間隔までは連結しない)。
-    """
-    items_sorted = sorted(items, key=lambda i: i["coord"])
-    coord_clusters: list[list[dict]] = []
-    for item in items_sorted:
-        if coord_clusters and abs(item["coord"] - coord_clusters[-1][-1]["coord"]) <= _COORDINATE_TOLERANCE:
-            coord_clusters[-1].append(item)
-        else:
-            coord_clusters.append([item])
-
-    faces: list[dict] = []
-    for cluster in coord_clusters:
-        coord = sum(i["coord"] for i in cluster) / len(cluster)
-        by_linewidth: dict[float | None, list[dict]] = {}
-        for item in cluster:
-            by_linewidth.setdefault(item["linewidth"], []).append(item)
-        for linewidth, group in by_linewidth.items():
-            group.sort(key=lambda i: i["lo"])
-            run = [group[0]]
-            run_hi = group[0]["hi"]
-            for item in group[1:]:
-                if item["lo"] - run_hi <= _MERGE_GAP_TOLERANCE:
-                    run.append(item)
-                    run_hi = max(run_hi, item["hi"])
-                else:
-                    faces.append(
-                        {
-                            "coord": coord,
-                            "lo": min(i["lo"] for i in run),
-                            "hi": run_hi,
-                            "linewidth": linewidth,
-                            "indices": tuple(i["index"] for i in run),
-                        }
-                    )
-                    run = [item]
-                    run_hi = item["hi"]
-            faces.append(
-                {
-                    "coord": coord,
-                    "lo": min(i["lo"] for i in run),
-                    "hi": run_hi,
-                    "linewidth": linewidth,
-                    "indices": tuple(i["index"] for i in run),
-                }
-            )
-    return faces
-
-
 def _collect_parallel_pairs(
     records: list[VectorRecord],
     excluded_indices: set[int],
@@ -211,7 +157,7 @@ def _collect_parallel_pairs(
     # ハッチング等、同一線幅の面が多数並ぶ箇所で組み合わせが爆発し、
     # かつ後段の閉ループ判定を欺くほど密なグラフができてしまう。
     for axis, items in aligned.items():
-        faces = sorted(_merge_axis_faces(items), key=lambda f: f["coord"])
+        faces = sorted(merge_axis_fragments(items, _MERGE_GAP_TOLERANCE), key=lambda f: f["coord"])
         for i, a in enumerate(faces):
             for b in faces[i + 1 :]:
                 thickness = b["coord"] - a["coord"]
@@ -273,51 +219,18 @@ def _collect_parallel_pairs(
 def _prune_to_closed_loops(pairs: list[WallPairSegment]) -> list[WallPairSegment]:
     """他の壁候補と繋がって閉ループ(部屋を一周する輪郭)を構成しない候補を除外する。
 
-    壁は必ず閉じた直線に囲まれている、という制約を反映する。各候補
-    (`WallPairSegment`)をセンターライン端点を結ぶグラフの1辺とみなし、
-    次数1のノード(=行き止まり端点)を持つ辺を繰り返し取り除く
-    (leaf-pruning、いわゆる2-core抽出)。最終的に残る辺は、必ず何らかの
-    閉路(部屋の輪郭)の一部になっている。
+    壁は必ず閉じた直線に囲まれている、という制約を反映する。汎用の
+    `geometry.prune_to_closed_loops`(センターライン端点グラフの2-core抽出=
+    leaf-pruning)を`WallPairSegment`向けに適用するラッパー。
 
     フローリング材等のハッチングは、隣接する線同士が独立した平行線対を
     作るだけで他の対と端点を共有しないため、この枝刈りで自然に除去される。
     """
     if not pairs:
         return []
-
-    def node_id(point: tuple[float, float]) -> tuple[int, int]:
-        return (round(point[0] / _CHAIN_TOLERANCE), round(point[1] / _CHAIN_TOLERANCE))
-
-    edge_nodes: list[tuple[tuple[int, int], tuple[int, int]]] = []
-    incident: dict[tuple[int, int], list[int]] = {}
-    degree: dict[tuple[int, int], int] = {}
-    for i, pair in enumerate(pairs):
-        a, b = _segment_endpoints(pair)
-        na, nb = node_id(a), node_id(b)
-        edge_nodes.append((na, nb))
-        incident.setdefault(na, []).append(i)
-        incident.setdefault(nb, []).append(i)
-        degree[na] = degree.get(na, 0) + 1
-        degree[nb] = degree.get(nb, 0) + 1
-
-    removed = [False] * len(pairs)
-    queue: deque[tuple[int, int]] = deque(node for node, d in degree.items() if d <= 1)
-    while queue:
-        node = queue.popleft()
-        if degree.get(node, 0) > 1:
-            continue
-        for edge_index in incident.get(node, []):
-            if removed[edge_index]:
-                continue
-            removed[edge_index] = True
-            na, nb = edge_nodes[edge_index]
-            other = nb if node == na else na
-            degree[node] -= 1
-            degree[other] -= 1
-            if degree[other] <= 1:
-                queue.append(other)
-
-    return [pair for i, pair in enumerate(pairs) if not removed[i]]
+    edges = [_segment_endpoints(pair) for pair in pairs]
+    survived = prune_to_closed_loops(edges, _CHAIN_TOLERANCE)
+    return [pair for pair, alive in zip(pairs, survived) if alive]
 
 
 def _segment_endpoints(segment: WallPairSegment) -> tuple[tuple[float, float], tuple[float, float]]:

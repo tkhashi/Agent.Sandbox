@@ -135,7 +135,7 @@ class CalibrationResult:
 
 ### 7.4 面の塗りつぶし(`FillPolygon`)
 
-壁分類(13章)のような、スコアに応じたグラデーション塗りつぶしを表現するため、`build_svg`は`fill_polygons: list[FillPolygon] | None = None`という追加引数を持つ(デフォルト`None`で既存呼び出しは無変更)。
+壁分類(11章)のような、スコアに応じたグラデーション塗りつぶしを表現するため、`build_svg`は`fill_polygons: list[FillPolygon] | None = None`という追加引数を持つ(デフォルト`None`で既存呼び出しは無変更)。
 
 ```python
 @dataclass(frozen=True)
@@ -146,6 +146,10 @@ class FillPolygon:
 ```
 
 `fill_polygons`が指定された場合、通常のstroke描画の後に`<polygon fill="{color}" fill-opacity="{opacity}">`要素を追加描画する。`render.py`は「ポリゴン+色+不透明度」のみを扱い、それが何を表すか(壁のスコア等)は一切関知しない(`highlight_indices`と同じ責務分離)。スコア値から色への変換は`_gradient_color(score_ratio, low_color, high_color)`が担い、RGB各チャンネルを線形補間する。スコア→比率(0〜1)への変換は呼び出し側(`classify_cli.py`)の責務。
+
+### 7.5 複数色の同時着色(`color_overrides`)
+
+読み取り不要情報分類(13章)のように、1枚のSVGで複数のカテゴリをそれぞれ異なる色で同時に着色したい場合のため、`build_svg`は`color_overrides: dict[int, str] | None = None`(レコードのインデックス→CSS色文字列の直接マッピング)を持つ。既存の`highlight_indices`/`highlight_color`(単一色のみ)は後方互換のため維持し、`color_overrides`にインデックスが含まれる場合はそちらが優先される。`render.py`はこの場合も色の意味を一切関知しない。
 
 ## 8. 抽出タスクCLI (`cli.py`)
 
@@ -410,7 +414,76 @@ uv run classify-drawing-frame <抽出JSONパス> [-o 出力JSONパス] [--pretty
 
 外枠に接する直線を無条件に図面枠とみなすため、外枠の角にたまたま接する装飾要素(本PDFでは左上の方位マークの枠)も図面枠として着色される。図面枠・図面メタ情報を同色で出力する現状の要件では実害はない。詳細は`docs/adr/0009-drawing-frame-classification.md`を参照。
 
-## 13. 検証方法
+## 13. 分類タスク: 読み取り不要な情報 (`classify/unread_info.py`, `classify_cli.py`)
+
+### 13.1 概要
+
+抽出タスクのJSON出力を読み込み、平面図を読み取る上で不要な情報(点線で閉じた輪郭・ハッチング・扇形(ドア記号))を分類する。内部で`classify_grid_lines`・`classify_dimension_lines`・`classify_wall_lines`・`classify_drawing_frame`を自動実行し、それらの分類結果に含まれるレコードは検出対象から除外する。
+
+他の分類タスクと異なり、**このタスクは全ての不要情報パターンを網羅することを目的としない**。「検出器レジストリ」方式(`classify_unread_info`が独立した検出関数を呼び出すだけの薄い構造)を採用し、新しい検出パターンを追加しやすくすることを設計上の主目的にしている(詳細は`docs/adr/0010-unread-info-classification.md`を参照)。
+
+初版で対応する3検出器:
+
+1. **点線で閉じた線(`_detect_dashed_closed_loops`)**: `line`の長さ分布から「短い(点線の点)」候補を絞り込み、端点が近いもの同士を軸を問わず連結、`geometry.prune_to_closed_loops`(leaf-pruning/2-core抽出)で成分内の全ての辺が生き残る(行き止まりが無い)場合のみ採用する
+2. **ハッチング(`_detect_hatching`)**: 軸並行の`line`(`curve`は対象外)を対象に、`geometry.find_evenly_spaced_runs`で同一線幅の面が4本以上ほぼ等間隔に並ぶ区間を検出し、線幅・間隔が近いインスタンス同士を同一グループに統合する(離れた場所にある同じパターンも統合対象)
+3. **扇形/ドア(`_detect_doors`)**: 既存の`geometry.find_arcs`を再利用する。壁分類(ADR0008)と同じ既知の限界(本PDFでは実際のドア記号と装飾円弧を分ける明確な閾値が無い)を引き継ぐ
+
+### 13.2 データ型
+
+```python
+@dataclass(frozen=True)
+class DashedClosedLoop:
+    line_indices: tuple[int, ...]
+
+@dataclass(frozen=True)
+class DoorSymbol:
+    arc_index: int
+    center: tuple[float, float]
+    radius: float
+
+@dataclass(frozen=True)
+class HatchInstance:
+    axis: Literal["horizontal", "vertical"]
+    linewidth: float | None
+    gap: float
+    line_indices: tuple[int, ...]
+
+@dataclass(frozen=True)
+class HatchGroup:
+    group_id: int
+    linewidth: float | None
+    gap: float
+    instances: tuple[HatchInstance, ...]
+    line_indices: tuple[int, ...]
+
+@dataclass(frozen=True)
+class UnreadInfoResult:
+    dashed_closed_loops: tuple[DashedClosedLoop, ...]
+    doors: tuple[DoorSymbol, ...]
+    hatch_groups: tuple[HatchGroup, ...]
+```
+
+### 13.3 分類タスクCLI
+
+エントリポイント: `classify-unread-info`
+
+```
+uv run classify-unread-info <抽出JSONパス> [-o 出力JSONパス] [--pretty] [--svg 出力SVGパス]
+```
+
+| オプション | 説明 |
+|---|---|
+| `-o, --output` | 検出した`dashed_closed_loops`/`doors`/`hatch_groups`をJSONファイルに出力 |
+| `--pretty` | JSON出力をインデント付きで整形 |
+| `--svg` | 扉を`#ffa500`、点線閉ループを`#999999`、ハッチングをグループごとのグラデーション(`#ff7f7f`〜`#bfff7f`)で着色した再現SVGの出力先 |
+
+複数カテゴリを1枚のSVGに同時着色するため、`render.build_svg`に`color_overrides: dict[int, str] | None`(インデックス→色の直接マッピング)を追加した(既存の`highlight_indices`/`highlight_color`は単一色のみのため後方互換のまま維持し、`color_overrides`が指定された場合はそちらを優先する)。
+
+### 13.4 既知の制約
+
+ドア検出(`find_arcs`)は壁分類(ADR0008)と同じ限界を持ち、本PDFでは実際のドア記号を検出できず装飾的な小さい円弧のみが検出される。ハッチングのグループ化に使う間隔の許容差は経験的な値であり、他のPDFでの再調整が必要になる可能性がある。詳細は`docs/adr/0010-unread-info-classification.md`を参照。
+
+## 14. 検証方法
 
 ### 抽出タスク
 
@@ -441,11 +514,19 @@ uv run classify-drawing-frame <抽出JSONパス> [-o 出力JSONパス] [--pretty
 2. 出力JSONで、外枠4辺(線幅11.5ptの長方形)と、下部表題欄を分割する区画線が検出されていることを確認する
 3. 出力SVGをラスタライズし、外枠・下部表題欄全体が`#ff00ff`で着色され、図面本体(通り芯・寸法線・壁等)は着色されていないことを目視確認する
 
-## 14. 今後の課題(未着手)
+### 読み取り不要情報分類
+
+1. `uv run classify-unread-info output/設計図-2階平面詳細図.json -o output/不要情報分類結果.json --svg output/不要情報分類.svg --pretty`を実行する
+2. コンソール出力で、フローリング材等のハッチンググループ・ドア候補件数を確認する
+3. 出力SVGをラスタライズし、フローリング材のハッチングがグループごとの色で着色され、それ以外の図面要素(通り芯・寸法線・壁・図面枠等)は着色されていないことを目視確認する
+4. `classify-grid-lines`/`classify-dimension-lines`/`classify-wall-lines`を再実行し、`geometry.py`の共通ヘルパー化(`merge_axis_fragments`, `prune_to_closed_loops`)により既存の検出結果(通り芯4本、寸法線36件、壁6件)が変化していないことを確認する
+
+## 15. 今後の課題(未着手)
 
 - **壁分類の再現率向上**: 壁候補のnearest-neighborペア化が、実際の壁の対向面に到達する前に装飾的なtick線・仕上げ表現に阻まれるケースが多く、検出漏れが多い(詳細は`docs/adr/0008-wall-classification.md`)。次回優先して取り組むべき課題
-- **ドア記号(扇形)検出の実データ検証**: `find_arcs`は円フィット自体は機能するが、本PDFでは装飾的な小さい円弧しか検出できていない
-- 引き出し線等、通り芯・寸法線・壁以外の図面要素分類の実装
+- **ドア記号(扇形)検出の実データ検証**: `find_arcs`は円フィット自体は機能するが、本PDFでは装飾的な小さい円弧しか検出できていない(壁分類・読み取り不要情報分類の両方が影響を受ける)
+- **点線閉ループ検出の実データ検証**: 本PDFでは0件だった。検出ロジック自体の妥当性は、閉じた点線輪郭を含む別のPDFで別途検証する必要がある
+- 引き出し線等、通り芯・寸法線・壁・図面枠・不要情報以外の図面要素分類の実装
 - 寸法線分類の閾値(`_WORD_TO_LINE_GAP_FACTOR`等)は本PDFで経験的に調整した値であり、他のPDFでの再調整が必要になる可能性がある
 - 埋め込みフォントのSVGへの埋め込み対応(文字位置・字形の完全再現)
 - 複数ページPDFへの対応(現状CLIの`--svg`は1ページ目のみを対象)
