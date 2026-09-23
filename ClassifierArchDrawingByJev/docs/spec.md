@@ -367,7 +367,50 @@ uv run classify-wall-lines <抽出JSONパス> [-o 出力JSONパス] [--pretty] [
 
 このタスクは通り芯・寸法線分類と異なり、実データでの精度検証が途上である。**再現率(検出漏れ)が低いことが判明している**(本PDFでの検証では、閉ループ制約により誤検出は解消できたが、壁候補953件中、最終的に壁と判定されたのは6件のみで、明らかに壁と分かる建物外周・室内間仕切りの大半を検出できていない)。またドア記号検出(`find_arcs`)は本PDFでは装飾的な小さい円弧しか検出できず、実質機能していない。詳細な原因分析・今後の改善方針は`docs/adr/0008-wall-classification.md`の「既知の制約」節を参照。
 
-## 12. 検証方法
+## 12. 分類タスク: 図面枠・図面メタ情報 (`classify/frame.py`, `classify_cli.py`)
+
+### 12.1 概要
+
+抽出タスクのJSON出力を読み込み、図面枠(用紙全体を囲む枠線)と図面メタ情報(案件名・スケール・図面番号等を記載する表題欄)を分類する。他の分類タスクと異なりスコアリングは行わず、以下の決定的な手順で判定する(詳細・実データでの検証結果は`docs/adr/0009-drawing-frame-classification.md`を参照)。
+
+1. 軸並行の`line`を線幅ごとにグループ化し、同一線幅の水平2本+垂直2本が閉じた長方形を構成する組み合わせのうち、**面積最大**のものを図面枠の外枠とする(候補はページ寸法の50%以上のスパンを持つものに限定し、組み合わせ爆発を防ぐ)
+2. 外枠の4辺いずれかに端点が乗っている軸並行の`line`を、すべて「図面枠」に属するものとして収集する(方向は水平・垂直のみ)
+3. 収集した直線のうち、外枠の全幅または全高にわたって伸びるもの(区画線)を使い、外枠の内側を格子状に分割する
+4. 分割後の領域のうち**面積最大のもの**を「図面(本体)」、それ以外を「図面メタ情報」とする
+5. 各`VectorRecord`(全オブジェクト種別)の中心座標が図面メタ情報の領域内にあれば、そのレコードを図面メタ情報に属するものとする
+
+### 12.2 データ型
+
+```python
+@dataclass(frozen=True)
+class DrawingFrame:
+    bounds: tuple[float, float, float, float]          # (x_lo, x_hi, y_lo, y_hi)
+    border_line_indices: tuple[int, ...]                # 外枠4辺
+    attached_line_indices: tuple[int, ...]              # 外枠に接する直線(区画線等)
+    drawing_bounds: tuple[float, float, float, float]   # 図面本体の領域
+    meta_bounds: tuple[tuple[float, float, float, float], ...]  # 図面メタ情報の領域(複数可)
+    meta_record_indices: tuple[int, ...]                # 図面メタ情報領域内の全レコード
+```
+
+### 12.3 分類タスクCLI
+
+エントリポイント: `classify-drawing-frame`
+
+```
+uv run classify-drawing-frame <抽出JSONパス> [-o 出力JSONパス] [--pretty] [--svg 出力SVGパス]
+```
+
+| オプション | 説明 |
+|---|---|
+| `-o, --output` | 検出した`DrawingFrame`をJSONファイルに出力 |
+| `--pretty` | JSON出力をインデント付きで整形 |
+| `--svg` | 図面枠・図面メタ情報を`#ff00ff`(単色)で着色した再現SVGの出力先 |
+
+### 12.4 既知の制約
+
+外枠に接する直線を無条件に図面枠とみなすため、外枠の角にたまたま接する装飾要素(本PDFでは左上の方位マークの枠)も図面枠として着色される。図面枠・図面メタ情報を同色で出力する現状の要件では実害はない。詳細は`docs/adr/0009-drawing-frame-classification.md`を参照。
+
+## 13. 検証方法
 
 ### 抽出タスク
 
@@ -392,7 +435,13 @@ uv run classify-wall-lines <抽出JSONパス> [-o 出力JSONパス] [--pretty] [
 2. 出力SVGをラスタライズし、フローリング材のハッチング・通り芯・寸法線が壁として誤って塗りつぶされていないことを確認する(誤検出防止は検証済み。検出漏れが多いことは既知の制約として11.4節に記載)
 3. `classify-grid-lines`/`classify-dimension-lines`を再実行し、`geometry.py`の共通ヘルパー化(`collect_axis_aligned_lines`, `collect_char_runs`, `split_by_relative_jump`)により既存の検出結果(通り芯4本、寸法線36件)が変化していないことを確認する
 
-## 13. 今後の課題(未着手)
+### 図面枠分類
+
+1. `uv run classify-drawing-frame output/設計図-2階平面詳細図.json -o output/図面枠分類結果.json --svg output/図面枠分類.svg --pretty`を実行する
+2. 出力JSONで、外枠4辺(線幅11.5ptの長方形)と、下部表題欄を分割する区画線が検出されていることを確認する
+3. 出力SVGをラスタライズし、外枠・下部表題欄全体が`#ff00ff`で着色され、図面本体(通り芯・寸法線・壁等)は着色されていないことを目視確認する
+
+## 14. 今後の課題(未着手)
 
 - **壁分類の再現率向上**: 壁候補のnearest-neighborペア化が、実際の壁の対向面に到達する前に装飾的なtick線・仕上げ表現に阻まれるケースが多く、検出漏れが多い(詳細は`docs/adr/0008-wall-classification.md`)。次回優先して取り組むべき課題
 - **ドア記号(扇形)検出の実データ検証**: `find_arcs`は円フィット自体は機能するが、本PDFでは装飾的な小さい円弧しか検出できていない
